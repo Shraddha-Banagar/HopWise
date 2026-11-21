@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.chroma/
+
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.externalNativeBuild/
+.cxx/
+
+.DS_Store
+Thumbs.db
+.env

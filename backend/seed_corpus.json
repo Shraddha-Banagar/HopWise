@@ -1,0 +1,100 @@
+{
+  "documents": [
+    {
+      "id": "corpus-001",
+      "title": "Ada Lovelace biography",
+      "entity": "Ada Lovelace",
+      "text": "Ada Lovelace was born in London in December 1815. Her father was the poet Lord Byron. She worked with Charles Babbage on the Analytical Engine and wrote a note describing an algorithm intended to be processed by the machine."
+    },
+    {
+      "id": "corpus-002",
+      "title": "Lord Byron biography",
+      "entity": "Lord Byron",
+      "text": "Lord Byron was an English Romantic poet born in 1788. He was the father of Ada Lovelace. He died in Greece in 1824 during the Greek War of Independence."
+    },
+    {
+      "id": "corpus-003",
+      "title": "Charles Babbage biography",
+      "entity": "Charles Babbage",
+      "text": "Charles Babbage was an English mathematician and inventor born in 1791. He designed the Difference Engine and later the Analytical Engine. He is often called a pioneer of computing."
+    },
+    {
+      "id": "corpus-004",
+      "title": "Analytical Engine specifications",
+      "entity": "Analytical Engine",
+      "text": "The Analytical Engine was a proposed general-purpose mechanical computer designed by Charles Babbage. It included an arithmetic unit called the mill, memory called the store, and support for conditional branching and loops."
+    },
+    {
+      "id": "corpus-005",
+      "title": "Grace Hopper biography",
+      "entity": "Grace Hopper",
+      "text": "Grace Hopper was an American computer scientist born in 1906. She developed the first compiler and helped create the COBOL programming language. She was nicknamed Amazing Grace."
+    },
+    {
+      "id": "corpus-006",
+      "title": "Compiler history",
+      "entity": "Compiler",
+      "text": "A compiler translates source code written in a high-level programming language into lower-level instructions. Grace Hopper built the A-0 compiler in 1952 for the UNIVAC I computer."
+    },
+    {
+      "id": "corpus-007",
+      "title": "Alan Turing biography",
+      "entity": "Alan Turing",
+      "text": "Alan Turing was an English mathematician born in 1912. He described the Turing machine, a theoretical model of computation. During World War II he worked at Bletchley Park on breaking German ciphers."
+    },
+    {
+      "id": "corpus-008",
+      "title": "Turing machine model",
+      "entity": "Turing machine",
+      "text": "The Turing machine is an abstract model of computation introduced by Alan Turing in 1936. It reads and writes symbols on an infinite tape according to a finite table of rules."
+    },
+    {
+      "id": "corpus-009",
+      "title": "Marie Curie biography",
+      "entity": "Marie Curie",
+      "text": "Marie Curie was a physicist and chemist born in Warsaw in 1867. She conducted pioneering research on radioactivity and discovered the elements polonium and radium with her husband Pierre Curie."
+    },
+    {
+      "id": "corpus-010",
+      "title": "Radioactivity research",
+      "entity": "Radioactivity",
+      "text": "Radioactivity is the process by which unstable atomic nuclei release energy. Marie Curie coined the term radioactivity and won Nobel Prizes in both Physics in 1903 and Chemistry in 1911."
+    },
+    {
+      "id": "corpus-011",
+      "title": "Himalaya mountain range",
+      "entity": "Himalayas",
+      "text": "The Himalayas are a mountain range in Asia separating the Indian subcontinent from the Tibetan Plateau. The range contains Mount Everest, the highest mountain above sea level."
+    },
+    {
+      "id": "corpus-012",
+      "title": "Mount Everest facts",
+      "entity": "Mount Everest",
+      "text": "Mount Everest is Earth's highest mountain above sea level, located in the Himalayas on the border between Nepal and China. Its summit is about 8849 metres above sea level."
+    },
+    {
+      "id": "corpus-013",
+      "title": "Solar System overview",
+      "entity": "Solar System",
+      "text": "The Solar System consists of the Sun and the objects orbiting it, including eight planets. Jupiter is the largest planet and has a storm called the Great Red Spot."
+    },
+    {
+      "id": "corpus-014",
+      "title": "Jupiter facts",
+      "entity": "Jupiter",
+      "text": "Jupiter is the fifth planet from the Sun and the largest planet in the Solar System. The Great Red Spot is a giant storm on Jupiter that has been observed for centuries."
+    },
+    {
+      "id": "corpus-015",
+      "title": "Water chemistry",
+      "entity": "Water",
+      "text": "Water is a chemical compound consisting of two hydrogen atoms and one oxygen atom, with formula H2O. It covers about 71 percent of Earth's surface."
+    },
+    {
+      "id": "corpus-016",
+      "title": "Photosynthesis process",
+      "entity": "Photosynthesis",
+      "text": "Photosynthesis is the process by which green plants convert light energy into chemical energy. Plants use carbon dioxide and water to produce glucose and oxygen."
+    }
+  ]
+}
