@@ -153,6 +153,117 @@ def _normalize(text: str) -> str:
     return re.sub(r"[^a-z0-9 ]", " ", text.lower()).strip()
 
 
+_CAPITALIZED_NAME = r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}"
+
+
+def _sentences(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+
+
+def _document_for_entity(entity: str, store: ChromaStore) -> dict[str, Any] | None:
+    needle = _normalize(entity)
+    for document in store.documents:
+        if _normalize(document["entity"]) == needle:
+            return document
+    return None
+
+
+def _is_person_entity(entity: str, store: ChromaStore) -> bool:
+    document = _document_for_entity(entity, store)
+    if document is None:
+        return False
+    text = f" {_normalize(document['text'])} "
+    markers = (
+        " he ",
+        " she ",
+        " his ",
+        " her ",
+        " was born ",
+        " died ",
+        " father ",
+        " poet ",
+        " scientist ",
+        " physicist ",
+        " chemist ",
+        " mathematician ",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _query_predicate(query: str) -> str:
+    lowered = _normalize(query)
+    if "father" in lowered or "dad" in lowered:
+        return "father"
+    if any(token in lowered for token in ("die", "died", "death")):
+        return "death_year"
+    if any(token in lowered for token in ("profession", "occupation")):
+        return "profession"
+    if "born" in lowered or "birth" in lowered:
+        return "birth_year"
+    if "storm" in lowered:
+        return "storm"
+    if "largest" in lowered and "planet" in lowered:
+        return "attribute"
+    if "highest" in lowered and any(token in lowered for token in ("mountain", "peak")):
+        return "attribute"
+    if "mountain range" in lowered or "which range" in lowered:
+        return "located_in"
+    if "discover" in lowered:
+        return "discovered"
+    if any(token in lowered for token in ("nobel", "prize", "award", "winner")) and any(
+        token in lowered for token in ("year", "when")
+    ):
+        return "award_year"
+    if any(token in lowered for token in ("located", "situated", "found in")):
+        return "located_in"
+    return "answer"
+
+
+def _fact_key(subject: str, predicate: str, value: str = "") -> str:
+    if predicate in {"discovered", "collaborator"}:
+        return _key(subject, f"{predicate} {value}")
+    return _key(subject, predicate)
+
+
+def _pronoun_anchor(fact: FactCandidate, store: ChromaStore) -> str:
+    if fact.predicate in {"father", "mother", "profession", "death_year", "birth_year", "award_year"}:
+        return fact.value
+    if _is_person_entity(fact.value, store) and fact.predicate not in {"discovered", "attribute", "located_in"}:
+        return fact.value
+    return fact.subject
+
+
+def _with_article(value: str) -> str:
+    value = _strip_leading_article(value.strip())
+    if not value:
+        return value
+    article = "an" if value[0].lower() in "aeiou" else "a"
+    return f"{article} {value}"
+
+
+def _superlative_phrase(value: str) -> str:
+    value = _strip_leading_article(value.strip())
+    if value and value.split()[0].lower() in {"highest", "largest"}:
+        return f"the {value}"
+    return value
+
+
+def _join_values(values: list[str]) -> str:
+    cleaned: list[str] = []
+    for value in values:
+        for part in re.split(r"\s+and\s+", value.strip(), flags=re.IGNORECASE):
+            item = _strip_leading_article(part.strip().rstrip(" ,.;:"))
+            if item and _normalize(item) not in {_normalize(seen) for seen in cleaned}:
+                cleaned.append(item)
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return ", ".join(cleaned[:-1]) + ", and " + cleaned[-1]
+
+
 def _find_entity(question: str, store: ChromaStore) -> str:
     lowered = question.lower()
     matches = [document["entity"] for document in store.documents if document["entity"].lower() in lowered]
@@ -160,6 +271,554 @@ def _find_entity(question: str, store: ChromaStore) -> str:
         people = ["CERN", "UNIVAC I", "Bletchley Park", "Great Red Spot"]
         matches = [item for item in people if item.lower() in lowered]
     return max(matches, key=len) if matches else "the topic"
+
+
+_DISCOVERY_FILLER = re.compile(
+    r"\s+(?:with|in|during|by|from|for|while|that|which|who|alongside|together|using|through"
+    r"|was|were|is|are|became|changed|led|helped|made|contributed|revolutionized|transformed)\b"
+    r"|\s+and\s+(?:her|his|their)\s+(?:husband|wife|partner|collaborator|team)\b",
+    re.IGNORECASE,
+)
+
+
+def _subject_names(question: str, target: str, store: ChromaStore) -> set[str]:
+    names = {_normalize(target)}
+    entity = _find_entity(question, store)
+    if entity != "the topic":
+        names.add(_normalize(entity))
+    match = re.search(
+        r"\bdid\s+([A-Za-z][A-Za-z\s]+?)\s+(?:discover|invent|develop|write|create|build|found|lead|design|compose)\b",
+        question,
+        re.IGNORECASE,
+    )
+    if match:
+        names.add(_normalize(match.group(1)))
+    return {name for name in names if name}
+
+
+def _clean_clause(clause: str) -> str:
+    cleaned = clause.strip().rstrip(" ,;:.!?").strip()
+    if not cleaned:
+        return ""
+    return cleaned[0].upper() + cleaned[1:] + "?"
+
+
+def _reference_clause(clause: str, hop_number: int, entity: str, store: ChromaStore) -> str:
+    working = clause.strip().rstrip(" ,;:.!?").strip()
+    placeholder = f"{{{{HOP_{hop_number}}}}}"
+    working = re.sub(r"\b(his|her|its|their)\b", f"{placeholder}'s", working, flags=re.IGNORECASE)
+    working = re.sub(
+        r"\b(he|she|it|they|him|them|this|that)\b",
+        placeholder,
+        working,
+        flags=re.IGNORECASE,
+    )
+
+    located = re.match(r"^in which ([a-z ]+?) is (.+?) located(?:\s+in)?$", working, re.IGNORECASE)
+    if located:
+        return _clean_clause(f"Which {located.group(1)} is {located.group(2)} located in")
+
+    leading = re.match(r"^(?:\{\{HOP_\d+\}\}\s+)?in which (.+)$", working, re.IGNORECASE)
+    if leading:
+        return _clean_clause(f"In which {leading.group(1)}")
+
+    return _clean_clause(working)
+
+
+def _strip_leading_article(value: str) -> str:
+    return re.sub(r"^(?:the|an|a)\s+", "", value.strip(), flags=re.IGNORECASE)
+
+
+def _range_display(value: str, store: ChromaStore | None = None) -> str:
+    value = _strip_leading_article(value)
+    lowered = _normalize(value)
+    if "range" in lowered:
+        return value
+    document = _document_for_entity(value, store) if store is not None else None
+    if document is not None and "mountain range" in document["title"].lower():
+        descriptor = re.sub(r"\s+mountain range\s*$", "", document["title"], flags=re.IGNORECASE).strip()
+        if descriptor:
+            if lowered.endswith("s") and not descriptor.lower().endswith(("n", "s")):
+                descriptor = f"{descriptor}n"
+            return f"{descriptor} mountain range"
+    if lowered.endswith("s") and not lowered.endswith("ss"):
+        return f"{value[:-1]}n mountain range"
+    return f"{value} mountain range"
+
+
+_PREDICATE_PHRASES = {
+    "father": "{subject}'s father was {value}",
+    "death_year": "{subject} died in {value}",
+    "birth_year": "{subject} was born in {value}",
+    "profession": "{subject} was {value}",
+    "discovered": "{subject} discovered {value}",
+    "discovered_elements": "{subject} discovered {value}",
+    "collaborator": "along with {value}",
+    "award_year": "{subject} won a prize in {value}",
+    "attribute": "{subject} is {value}",
+    "highest_mountain": "{subject} is {value}",
+    "mountain_range": "{subject} is located in the {value}",
+    "located_in": "{subject} is located in the {value}",
+    "largest_planet": "{subject} is {value}",
+    "storm": "{subject} has a storm called the {value}",
+    "jupiter_storm": "{subject} has a storm called the {value}",
+    "answer": "{subject} is {value}",
+}
+
+
+def _phrase_fact(fact: FactCandidate, anchor: str | None = None) -> str:
+    subject = fact.subject
+    if anchor and _normalize(subject) in {_normalize(anchor), _normalize(fact.value)}:
+        subject = "it"
+    value = _strip_leading_article(fact.value)
+    if fact.predicate == "profession":
+        value = _with_article(value)
+    elif fact.predicate in {"located_in", "mountain_range"} and "range" not in _normalize(value):
+        value = _range_display(value)
+    template = _PREDICATE_PHRASES.get(fact.predicate, "{subject} " + fact.predicate.replace("_", " ") + " {value}")
+    return template.format(subject=subject, value=value)
+
+
+def _join_phrases(phrases: list[str]) -> str:
+    answer = phrases[0]
+    for phrase in phrases[1:]:
+        answer += ", and " + phrase
+    answer = answer.strip()
+    return answer[0].upper() + answer[1:] + "."
+
+
+def _fact_supported(fact: FactCandidate, hop_evidence: dict[int, list[SearchHit]]) -> bool:
+    hits = [hit for hit in hop_evidence.get(fact.hop, []) if hit.doc_id == fact.source_id]
+    if not hits:
+        return False
+    text = _normalize(" ".join(hit.text for hit in hits))
+    value = _normalize(fact.value)
+    subject = _normalize(fact.subject)
+    if not value or value not in text:
+        return False
+    return not subject or subject == "the topic" or subject in text
+
+
+def _extract_relation(query: str, text: str, target: str, store: ChromaStore) -> tuple[str, str]:
+    lowered = _normalize(query)
+    predicate = "answer"
+    value = ""
+
+    if "father" in lowered:
+        predicate = "father"
+        for pattern in (
+            r"(?:His|Her|Their|The) father was (?:the\s+)?(?:[a-z]+\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})",
+            r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}) was the father of",
+        ):
+            match = re.search(pattern, text)
+            if match:
+                value = match.group(1).strip()
+                if _normalize(value) == _normalize(target) or _normalize(value) in {
+                    "he", "she", "it", "they", "the", "his", "her", "their",
+                }:
+                    value = ""
+                break
+    elif any(token in lowered for token in ("die", "died", "death")):
+        predicate = "death_year"
+        match = re.search(r"died in(?:\s+[A-Z][a-z]+)*\s+in\s+(\d{4})", text) or re.search(
+            r"(?:died in|death in)\s+(\d{4})", text
+        )
+        if match:
+            value = match.group(1)
+    elif "born" in lowered:
+        predicate = "birth_year"
+        match = re.search(r"born in (\d{4})", text)
+        if match:
+            value = match.group(1)
+    elif any(token in lowered for token in ("discover", "discovered", "discovery")) and "element" in lowered:
+        predicate = "discovered_elements"
+        match = re.search(
+            r"\bdiscover(?:ed|ies|y)?\s+(?:of\s+)?(?:(?:the\s+)?elements?\s+)?"
+            r"([A-Za-z]+(?:\s+[A-Za-z]+)*?)"
+            r"(?=\s+(?:with|in|during|by|from|for|while|that|which|who|alongside|together"
+            r"|was|were|is|are|became|changed|led|helped|made|contributed|revolutionized|transformed)\b"
+            r"|\s+and\s+(?:her|his|their)\s+(?:husband|wife|partner|collaborator|team)\b"
+            r"|[.,;:]|$)",
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            value = _DISCOVERY_FILLER.split(match.group(1), maxsplit=1)[0].strip()
+            value = re.sub(r"^(?:the|that|which|of)\s+", "", value, flags=re.IGNORECASE).strip()
+            if _normalize(value) in _subject_names(query, target, store):
+                value = ""
+    elif "year" in lowered and any(token in lowered for token in ("nobel", "prize", "award", "win", "won")):
+        predicate = "award_year"
+        match = None
+        for category in ("physics", "chemistry", "medicine", "literature", "peace"):
+            if category in lowered:
+                match = re.search(rf"\b{category}\s+in\s+(\d{{4}})", text, re.IGNORECASE)
+                if match:
+                    break
+        if match is None:
+            match = re.search(r"(?:won|win|received|awarded)[^.]*?\b(?:in\s+)?(\d{4})", text, re.IGNORECASE)
+        if match:
+            value = match.group(1)
+    elif "highest" in lowered and "mountain" in lowered:
+        predicate = "highest_mountain"
+        for pattern in (
+            r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+is\s+(?:Earth'?s\s+)?(?:the\s+)?highest\s+mountain\b",
+            r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*),?\s+the\s+highest\s+mountain\b",
+        ):
+            match = re.search(pattern, text)
+            if match:
+                value = _strip_leading_article(match.group(1).strip())
+                if _normalize(value) == _normalize(target):
+                    value = ""
+                break
+    elif any(token in lowered for token in ("mountain range", "which range", "located", "situated", "found in")):
+        predicate = "mountain_range" if any(token in lowered for token in ("mountain range", "which range")) else "located_in"
+        if target == "the topic" or _normalize(target) in _normalize(text):
+            for pattern in (
+                r"\b(?:located|situated|found)\s+in\s+(?:the\s+)?([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)",
+                r"\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)\s+is\s+a\s+mountain range\b",
+            ):
+                match = re.search(pattern, text)
+                if match:
+                    value = _strip_leading_article(match.group(1).strip())
+                    if _normalize(value) == _normalize(target):
+                        value = ""
+                    break
+    elif "largest" in lowered and "planet" in lowered:
+        predicate = "largest_planet"
+        match = re.search(r"([A-Z][a-z]+) is the fifth planet from the Sun and the largest planet", text)
+        if match:
+            value = match.group(1)
+    elif "storm" in lowered and "jupiter" in lowered:
+        predicate = "jupiter_storm"
+        for pattern in (
+            r"storm called the ([A-Z][\w]+(?: [A-Z][\w]+)*)",
+            r"\b([A-Z][\w]+(?:\s+[A-Z][\w]+)*)\s+is\s+a\s+(?:giant\s+)?storm\b",
+        ):
+            match = re.search(pattern, text)
+            if match:
+                value = _strip_leading_article(match.group(1).strip())
+                break
+
+    if not value and predicate in {"death_year", "birth_year", "award_year"}:
+        return predicate, ""
+
+    if not value:
+        cue = re.search(
+            r"\b(?:located|situated|found|based)\s+(?:in|at|on)\s+(?:the\s+)?"
+            r"([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)",
+            text,
+        )
+        if cue:
+            candidate = _strip_leading_article(cue.group(1).strip())
+            if _normalize(candidate) not in _subject_names(query, target, store):
+                value = candidate
+
+    if not value:
+        subject_names = _subject_names(query, target, store)
+        subject_tokens = {token for name in subject_names for token in name.split()}
+        query_tokens = (
+            set(_normalize(query).split())
+            - {"the", "who", "what", "was", "is", "did", "of", "in", "which", "a"}
+            - subject_tokens
+        )
+        best_sentence = ""
+        best_overlap = 0
+        for sentence in re.split(r"(?<=[.!?])\s+", text):
+            overlap = len(query_tokens & set(_normalize(sentence).split()))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_sentence = sentence
+        pronouns = {"she", "he", "it", "they", "her", "his", "their"}
+        for match in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b", best_sentence):
+            candidate = match.group(1).strip()
+            normalized = _normalize(candidate)
+            if normalized in subject_names or normalized in pronouns:
+                continue
+            if best_overlap >= 2:
+                value = candidate
+            break
+
+    return predicate, value
+
+
+def _semantic_facts(
+    query: str,
+    hits: list[SearchHit],
+    hop: int,
+    target: str,
+    store: ChromaStore,
+    exclude_values: set[str] | None = None,
+) -> list[FactCandidate]:
+    predicate = _query_predicate(query)
+    excluded = exclude_values or set()
+    query_norm = _normalize(query)
+    pairs = [(hit, sentence) for hit in hits if hit.score >= MIN_SCORE for sentence in _sentences(hit.text)]
+    results: list[FactCandidate] = []
+    index_by_key: dict[str, int] = {}
+
+    def add(subject: str, name: str, value: str, hit: SearchHit) -> None:
+        subject = subject.strip()
+        value = _strip_leading_article(value.strip().rstrip(" ,.;:"))
+        if not subject or not value or _normalize(subject) == "the topic":
+            return
+        if _normalize(value) in excluded:
+            return
+        key = _fact_key(subject, name, value)
+        candidate = FactCandidate(
+            key=key,
+            subject=subject,
+            predicate=name,
+            value=value,
+            source_id=hit.doc_id,
+            source_title=hit.title,
+            confidence=min(0.99, round(0.55 + hit.score, 3)),
+            query=query,
+            hop=hop,
+        )
+        if key in index_by_key:
+            index = index_by_key[key]
+            if len(value) > len(results[index].value):
+                results[index] = candidate
+            return
+        index_by_key[key] = len(results)
+        results.append(candidate)
+
+    def subject_for(hit: SearchHit) -> str:
+        if target != "the topic":
+            return target
+        return hit.entity if hit.entity and hit.entity != "the topic" else ""
+
+    if predicate == "father":
+        for hit, sentence in pairs:
+            subject = target if target != "the topic" else ""
+            value = ""
+            match = re.search(rf"\b({_CAPITALIZED_NAME})\s+was the father of\s+({_CAPITALIZED_NAME})\b", sentence)
+            if match:
+                candidate = match.group(1).strip()
+                if _normalize(candidate) not in {"he", "she", "it", "they", "his", "her", "their"}:
+                    subject = match.group(2) if target == "the topic" else target
+                    value = candidate
+            match = re.search(
+                r"\b(?:His|Her|Their|The|his|her|their|the)\s+father\s+was\s+(?:the\s+)?"
+                r"(?:(?:poet|Poet|writer|Writer|scientist|Scientist|mathematician|Mathematician|artist|Artist|engineer|Engineer)\s+)?"
+                rf"({_CAPITALIZED_NAME})\b",
+                sentence,
+            )
+            if match:
+                candidate = match.group(1).strip()
+                if _normalize(candidate) not in {"he", "she", "it", "they", "his", "her", "their"}:
+                    subject = target if target != "the topic" else subject_for(hit)
+                    value = candidate
+            if subject and value and _normalize(value) != _normalize(subject):
+                add(subject, "father", value, hit)
+
+    elif predicate in {"death_year", "birth_year", "award_year"}:
+        for hit, sentence in pairs:
+            subject = subject_for(hit)
+            value = ""
+            lowered = _normalize(sentence)
+            if predicate == "death_year":
+                match = re.search(r"\bdied\b[^.]*?\b(\d{4})\b", sentence) or re.search(
+                    r"\bdeath in\s+(\d{4})\b", sentence
+                )
+                if match:
+                    value = match.group(1)
+            elif predicate == "birth_year":
+                match = re.search(r"\bborn in\s+(\d{4})\b", sentence)
+                if match:
+                    value = match.group(1)
+            else:
+                category = next(
+                    (
+                        item
+                        for item in ("physics", "chemistry", "medicine", "literature", "peace")
+                        if item in query_norm
+                    ),
+                    "",
+                )
+                match = re.search(rf"\b{category}\s+in\s+(\d{{4}})", sentence, re.IGNORECASE) if category else None
+                if match is None:
+                    match = re.search(r"(?:won|win|received|awarded)[^.]*?\b(\d{4})\b", sentence, re.IGNORECASE)
+                if match and ("nobel" in lowered or "prize" in lowered or "award" in lowered):
+                    value = match.group(1)
+            if subject and value:
+                add(subject, predicate, value, hit)
+
+    elif predicate == "profession":
+        for hit, sentence in pairs:
+            match = re.search(
+                r"\b(?:was|is)\s+(?:an?|the)\s+"
+                r"([A-Z][A-Za-z-]+(?:\s+[A-Z][A-Za-z-]+)*(?:\s+[a-z][a-z-]+)?)"
+                r"(?=\s+(?:born|died|who|and|in|from|,|\.|$))",
+                sentence,
+            )
+            if match:
+                add(subject_for(hit), "profession", match.group(1), hit)
+
+    elif predicate == "attribute" and "highest" in query_norm:
+        for hit, sentence in pairs:
+            lowered = _normalize(sentence)
+            value = "highest mountain above sea level" if "above sea level" in lowered else "highest mountain"
+            match = re.search(
+                rf"\b({_CAPITALIZED_NAME})\s+is\s+(?:Earth'?s\s+)?(?:the\s+)?highest mountain\b",
+                sentence,
+            ) or re.search(rf"\b({_CAPITALIZED_NAME}),?\s+the\s+highest mountain\b", sentence)
+            if match:
+                add(match.group(1), "attribute", value, hit)
+
+    elif predicate == "attribute" and "largest" in query_norm:
+        for hit, sentence in pairs:
+            if "largest planet" not in _normalize(sentence):
+                continue
+            descriptor = re.search(
+                r"\blargest planet in the\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)?)\b", sentence
+            )
+            value = f"largest planet in the {descriptor.group(1)}" if descriptor else "largest planet"
+            match = re.search(rf"\b({_CAPITALIZED_NAME})\b[^.]*?\blargest planet\b", sentence)
+            if target != "the topic":
+                subject = target
+            elif match:
+                subject = match.group(1)
+            else:
+                continue
+            add(subject, "attribute", value, hit)
+
+    elif predicate == "storm":
+        for hit, sentence in pairs:
+            match = re.search(r"\bstorm called the\s+([A-Z][\w]+(?:\s+[A-Z][\w]+)*)", sentence)
+            value = match.group(1) if match else ""
+            subject = target if target != "the topic" else subject_for(hit)
+            if not match:
+                match = re.search(
+                    rf"\b({_CAPITALIZED_NAME})\s+is\s+a\s+(?:giant\s+)?storm on\s+({_CAPITALIZED_NAME})",
+                    sentence,
+                )
+                if match:
+                    value = match.group(1)
+                    if target == "the topic":
+                        subject = match.group(2)
+            if subject and value:
+                add(subject, "storm", value, hit)
+
+    elif predicate == "located_in":
+        for hit, sentence in pairs:
+            subject = target if target != "the topic" else subject_for(hit)
+            value = ""
+            match = re.search(rf"\b(?:located|situated|found)\s+in\s+(?:the\s+)?({_CAPITALIZED_NAME})\b", sentence)
+            if match:
+                candidate = match.group(1).strip()
+                if _normalize(candidate) != _normalize(subject):
+                    value = candidate
+            if not value and _normalize(subject) in _normalize(sentence) and "mountain range" in sentence.lower():
+                if hit.entity and _normalize(hit.entity) != _normalize(subject):
+                    value = hit.entity
+            if subject and value:
+                add(subject, "located_in", value, hit)
+
+    elif predicate == "discovered":
+        for hit, sentence in pairs:
+            if "discover" not in _normalize(sentence):
+                continue
+            match = re.search(
+                r"\bdiscover(?:ed|ies|y)?\s+(?:the\s+)?(?:elements?\s+)?"
+                r"([a-z][a-z-]+(?:\s+and\s+[a-z][a-z-]+)?)",
+                sentence,
+                re.IGNORECASE,
+            )
+            if not match:
+                continue
+            parsed = [part.strip().rstrip(" ,.;:") for part in re.split(r"\s+and\s+", match.group(1), flags=re.IGNORECASE)]
+            selected = [item for item in parsed if item and _normalize(item) not in excluded]
+            mentioned = [item for item in selected if _normalize(item) in query_norm]
+            if mentioned:
+                selected = mentioned
+            subject = target if target != "the topic" else subject_for(hit)
+            for value in selected:
+                add(subject, "discovered", value, hit)
+            if not selected:
+                continue
+            collaborator = re.search(
+                r"\bwith\s+(his|her|their)\s+(husband|wife|partner|collaborator)\s+"
+                rf"({_CAPITALIZED_NAME})\b",
+                sentence,
+            )
+            if collaborator:
+                value = f"{collaborator.group(1)} {collaborator.group(2)} {collaborator.group(3)}"
+                add(subject, "collaborator", value, hit)
+
+    if not results and predicate == "answer":
+        for hit, sentence in pairs:
+            fallback_predicate, value = _extract_relation(query, sentence, target, store)
+            if value:
+                add(subject_for(hit), fallback_predicate, value, hit)
+
+    return results
+
+
+def _synthesize_answer(question: str, facts: list[FactCandidate], store: ChromaStore | None = None) -> str:
+    if not facts:
+        return ""
+    grouped: dict[str, list[FactCandidate]] = {}
+    for fact in facts:
+        grouped.setdefault(fact.predicate, []).append(fact)
+
+    father = grouped.get("father", [None])[0]
+    profession = next(
+        (fact for fact in grouped.get("profession", []) if father and _normalize(fact.subject) == _normalize(father.value)),
+        None,
+    )
+    death = next(
+        (fact for fact in grouped.get("death_year", []) if father and _normalize(fact.subject) == _normalize(father.value)),
+        None,
+    )
+    if father and profession:
+        return f"{father.subject}'s father was {father.value}, {_with_article(profession.value)}."
+    if father and death:
+        return f"{father.subject}'s father was {father.value}, who died in {death.value}."
+
+    attributes = grouped.get("attribute", [])
+    mountain = next((fact for fact in attributes if "highest mountain" in _normalize(fact.value)), None)
+    ranges = grouped.get("located_in", [])
+    if mountain and ranges:
+        location = ranges[0]
+        return _join_phrases(
+            [
+                f"{mountain.subject} is {_superlative_phrase(mountain.value)}",
+                f"it is located in the {_range_display(location.value, store)}",
+            ]
+        )
+
+    planet = next((fact for fact in attributes if "largest planet" in _normalize(fact.value)), None)
+    storm = grouped.get("storm", [None])[0]
+    if planet and storm:
+        return _join_phrases(
+            [
+                f"{planet.subject} is {_superlative_phrase(planet.value)}",
+                f"it has a storm called the {_strip_leading_article(storm.value)}",
+            ]
+        )
+
+    discoveries = grouped.get("discovered", []) + grouped.get("discovered_elements", [])
+    if discoveries:
+        subject = discoveries[0].subject
+        values = _join_values([fact.value for fact in discoveries])
+        phrase = f"{subject} discovered {values}"
+        collaborator = grouped.get("collaborator", [None])[0]
+        if collaborator:
+            phrase += f", along with {collaborator.value}"
+        award = grouped.get("award_year", [None])[0]
+        if award:
+            phrase += f", and won a prize in {award.value}"
+        return phrase + "."
+
+    if len(facts) == 1:
+        return _join_phrases([_phrase_fact(facts[0])])
+    phrases: list[str] = []
+    anchor = facts[0].subject
+    for fact in facts:
+        phrases.append(_phrase_fact(fact, anchor))
+    return _join_phrases(phrases)
 
 
 class LLMClient:
@@ -205,25 +864,26 @@ class LLMClient:
         except Exception:
             return ""
 
-    def phrase_answer(self, question: str, facts: list[FactCandidate]) -> str:
+    def phrase_answer(
+        self,
+        question: str,
+        facts: list[FactCandidate],
+        store: ChromaStore | None = None,
+    ) -> str:
         if not facts:
             return "Insufficient evidence in knowledge base"
-        deterministic = ", ".join(f"{fact.subject}: {fact.value}" for fact in facts)
+        deterministic = _synthesize_answer(question, facts, store)
+        if deterministic:
+            return deterministic
+        evidence = ", ".join(f"{fact.subject}: {fact.value}" for fact in facts)
         result = self._invoke(
             "You are a precise trivia answer editor. Use only the supplied evidence. "
             "Return one short declarative sentence with no preamble.",
-            f"Question: {question}\nVerified evidence: {deterministic}\nAnswer:",
+            f"Question: {question}\nVerified evidence: {evidence}\nAnswer:",
         )
         if result and len(result) < 400:
             return result.replace("\n", " ").strip()
-        if len(facts) == 1:
-            return f"{facts[0].subject}: {facts[0].value}."
-        father_fact = next((fact for fact in facts if fact.predicate == "father"), None)
-        death_fact = next((fact for fact in facts if fact.predicate == "death_year"), None)
-        if father_fact and death_fact:
-            return f"{father_fact.subject}'s father was {father_fact.value}, who died in {death_fact.value}."
-        clauses = [f"{fact.subject} {fact.predicate.replace('_', ' ')} {fact.value}" for fact in facts]
-        return "; ".join(clauses).capitalize() + "."
+        return _join_phrases([_phrase_fact(fact) for fact in facts])
 
     def audit(self, claim: str, evidence: str) -> str:
         result = self._invoke(
@@ -294,93 +954,32 @@ class AgentPipeline:
 
         clauses = [clause.strip() for clause in question.split(" and ") if clause.strip()]
         if len(clauses) > 1:
-            resolved = [clauses[0]] + [f"{{{{HOP_{index}}}}} {clause}" for index, clause in enumerate(clauses[1:], start=1)]
+            resolved = [_clean_clause(clauses[0])]
+            for index, clause in enumerate(clauses[1:], start=1):
+                resolved.append(_reference_clause(clause, index, entity, self.store))
             return Plan(scenario, resolved[: request.max_hops], entity, "generic")
-        return Plan(scenario, [question][: request.max_hops], entity, "generic")
+        return Plan(scenario, [_clean_clause(question)][: request.max_hops], entity, "generic")
 
-    def _extract_fact(self, query: str, hits: list[SearchHit], hop: int, target: str) -> FactCandidate | None:
-        text = " ".join(hit.text for hit in hits)
-        lowered = _normalize(query)
-        top = hits[0] if hits else None
-        if top is None or top.score < MIN_SCORE:
-            return None
+    def _extract_fact(
+        self,
+        query: str,
+        hits: list[SearchHit],
+        hop: int,
+        target: str,
+        exclude_values: set[str] | None = None,
+    ) -> list[FactCandidate]:
+        if not hits or hits[0].score < MIN_SCORE:
+            return []
+        return _semantic_facts(query, hits, hop, target, self.store, exclude_values)
 
-        value = ""
-        predicate = "answer"
-        if "father" in lowered:
-            predicate = "father"
-            for pattern in (
-                r"(?:His|Her|Their|The) father was (?:the\s+)?(?:[a-z]+\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})",
-                r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}) was the father of",
-            ):
-                match = re.search(pattern, text)
-                if match:
-                    value = match.group(1).strip()
-                    if _normalize(value) == _normalize(target):
-                        value = ""
-                    break
-        elif any(token in lowered for token in ("die", "died", "death")):
-            predicate = "death_year"
-            match = re.search(r"died in(?:\s+[A-Z][a-z]+)*\s+in\s+(\d{4})", text) or re.search(
-                r"(?:died in|death in)\s+(\d{4})", text
-            )
-            if match:
-                value = match.group(1)
-        elif "born" in lowered:
-            predicate = "birth_year"
-            match = re.search(r"born in (\d{4})", text)
-            if match:
-                value = match.group(1)
-        elif "discovered" in lowered and "elements" in lowered:
-            predicate = "discovered_elements"
-            match = re.search(r"discovered the elements ([\w]+ and [\w]+)", text)
-            if match:
-                value = match.group(1)
-        elif "highest" in lowered and "mountain" in lowered:
-            predicate = "highest_mountain"
-            match = re.search(r"([A-Z][a-z]+(?: [A-Z][a-z]+)?) is Earth'?s highest mountain", text)
-            if match:
-                value = match.group(1)
-        elif "largest" in lowered and "planet" in lowered:
-            predicate = "largest_planet"
-            match = re.search(r"([A-Z][a-z]+) is the fifth planet from the Sun and the largest planet", text)
-            if match:
-                value = match.group(1)
-        elif "storm" in lowered and "jupiter" in lowered:
-            predicate = "jupiter_storm"
-            match = re.search(r"storm called the ([A-Z][\w]+(?: [A-Z][\w]+)*)", text)
-            if match:
-                value = match.group(1)
-
-        if not value and predicate in {"death_year", "birth_year"}:
-            return None
-
-        if not value:
-            query_tokens = set(_normalize(query).split()) - {"the", "who", "what", "was", "is", "did", "of", "in", "which", "a"}
-            best_sentence = ""
-            best_overlap = 0
-            for sentence in re.split(r"(?<=[.!?])\s+", text):
-                overlap = len(query_tokens & set(_normalize(sentence).split()))
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_sentence = sentence
-            match = re.search(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b", best_sentence)
-            if match and best_overlap >= 2:
-                value = match.group(1).strip()
-
-        if not value:
-            return None
-        return FactCandidate(
-            key=_key(target, predicate),
-            subject=target,
-            predicate=predicate,
-            value=value,
-            source_id=top.doc_id,
-            source_title=top.title,
-            confidence=min(0.99, round(0.55 + top.score, 3)),
-            query=query,
-            hop=hop,
-        )
+    @staticmethod
+    def _candidate_from_record(record: Any, query: str = "", hop: int = 0) -> FactCandidate:
+        fields = {field: getattr(record, field) for field in FactCandidate.__dataclass_fields__}
+        if query:
+            fields["query"] = query
+        if hop:
+            fields["hop"] = hop
+        return FactCandidate(**fields)
 
     @staticmethod
     def _evidence(hits: list[SearchHit]) -> list[EvidenceRecord]:
@@ -404,59 +1003,59 @@ class AgentPipeline:
         memory: SessionMemory,
         target: str,
         counters: dict[str, int],
-    ) -> tuple[TraceStep, FactCandidate | None, list[SearchHit], bool]:
+        exclude_values: set[str] | None = None,
+    ) -> tuple[TraceStep, list[FactCandidate], list[SearchHit], bool]:
         started = time.perf_counter()
-        cached_key = None
-        if "father" in _normalize(query):
-            cached_key = _key(target, "father")
-        elif any(token in _normalize(query) for token in ("die", "died", "death")):
-            for fact in memory.facts.values():
-                if fact.predicate == "father":
-                    cached_key = _key(fact.value, "death_year")
-                    break
-        cached = memory.get(cached_key) if cached_key else None
-
-        if cached is not None:
-            counters["cache_hits"] += 1
-            step = TraceStep(
-                id=str(uuid.uuid4()),
-                agent="researcher",
-                hop=hop,
-                title=f"Hop {hop} - Session Memory hit",
-                status="cache_hit",
-                thought=f"Check cached verified facts before querying Chroma for: {query}",
-                action=f"MemoryLookup[{cached.key}]",
-                observation=f"Reused verified fact '{cached.value}' from {cached.source_title}. No retrieval call made.",
-                latency_ms=round((time.perf_counter() - started) * 1000, 3),
-            )
-            candidate = FactCandidate(**{field: getattr(cached, field) for field in FactCandidate.__dataclass_fields__})
-            return step, candidate, [], True
-
         hits = self.store.search(query, k)
         counters["retrieval_calls"] += 1
-        candidate = self._extract_fact(query, hits, hop, target)
+        candidates = self._extract_fact(query, hits, hop, target, exclude_values)
+        predicate = _query_predicate(query)
+        cache_hit = False
+
+        if candidates:
+            records = [memory.get(candidate.key) for candidate in candidates]
+            if all(record is not None for record in records):
+                cache_hit = all(
+                    any(
+                        record is not None
+                        and _normalize(record.value) == _normalize(candidate.value)
+                        and record.source_id == candidate.source_id
+                        for record in records
+                    )
+                    for candidate in candidates
+                )
+        elif target != "the topic" and predicate != "answer":
+            record = memory.get(_key(target, predicate))
+            if record and any(
+                hit.doc_id == record.source_id and _normalize(record.value) in _normalize(hit.text) for hit in hits
+            ):
+                candidates = [self._candidate_from_record(record, query, hop)]
+                cache_hit = True
+
+        if cache_hit:
+            counters["cache_hits"] += 1
         top_score = hits[0].score if hits else 0.0
-        observation = (
-            f"Top similarity {top_score:.3f}. "
-            + (
-                f"Candidate fact: {candidate.value} ({candidate.source_title})."
-                if candidate
-                else "No supported fact was found in the retrieved chunks."
-            )
-        )
+        candidate_summary = _join_values([candidate.value for candidate in candidates])
+        observation = f"Top similarity {top_score:.3f}. "
+        if cache_hit:
+            observation += "Session memory verified this relation; fresh Chroma evidence agrees and was retained."
+        elif candidate_summary:
+            observation += f"Candidate fact: {candidate_summary}."
+        else:
+            observation += "No supported fact was found in the retrieved chunks."
         step = TraceStep(
             id=str(uuid.uuid4()),
             agent="researcher",
             hop=hop,
             title=f"Hop {hop} - Researcher",
-            status="ok" if candidate else "warning",
+            status="ok" if candidates else "warning",
             thought=f"Resolve sub-question {hop}: {query}",
             action=f"ChromaSearch[query='{query}', k={k}]",
             observation=observation,
             evidence=self._evidence(hits),
             latency_ms=round((time.perf_counter() - started) * 1000, 3),
         )
-        return step, candidate, hits, False
+        return step, candidates, hits, cache_hit
 
     def run(self, request: QueryRequest) -> QueryResponse:
         started = time.perf_counter()
@@ -492,25 +1091,45 @@ class AgentPipeline:
         hop_evidence: dict[int, list[SearchHit]] = {}
         cached_flags: dict[int, bool] = {}
         for index, sub_question in enumerate(plan.sub_questions, start=1):
-            query = sub_question
-            for hop_number, fact in enumerate(facts, start=1):
-                query = query.replace("{{HOP_%d}}" % hop_number, fact.value)
-            query = re.sub(r"\{\{HOP_\d+\}\}", plan.target_entity, query).strip()
+            references = [int(value) for value in re.findall(r"\{\{HOP_(\d+)\}\}", sub_question)]
+
+            def resolve(match: re.Match[str]) -> str:
+                position = int(re.search(r"\d+", match.group(0)).group(0)) - 1
+                if 0 <= position < len(facts):
+                    return _pronoun_anchor(facts[position], self.store)
+                return plan.target_entity
+
+            query = re.sub(r"\{\{HOP_\d+\}\}", resolve, sub_question).strip()
             resolved.append(query)
-            hop_target = facts[-1].value if index > 1 and facts else plan.target_entity
-            step, candidate, hits, was_cached = self._retrieve(query, index, request.k, memory, hop_target, counters)
+            uses_previous = any(reference <= index - 1 for reference in references)
+            if uses_previous and facts and references:
+                hop_target = _pronoun_anchor(facts[references[-1] - 1], self.store)
+            else:
+                hop_target = plan.target_entity
+            exclude_values = {_normalize(fact.value) for fact in facts} if uses_previous else set()
+            step, candidates, hits, was_cached = self._retrieve(
+                query,
+                index,
+                request.k,
+                memory,
+                hop_target,
+                counters,
+                exclude_values,
+            )
             steps.append(step)
             used_hits.extend(hits)
             hop_evidence[index] = hits
             cached_flags[index] = was_cached
-            if candidate:
-                facts.append(candidate)
+            existing_keys = {fact.key for fact in facts}
+            for candidate in candidates:
+                if candidate.key not in existing_keys:
+                    facts.append(candidate)
+                    existing_keys.add(candidate.key)
 
         unsupported = [
             fact
             for fact in facts
-            if not cached_flags.get(fact.hop, False)
-            and fact.value.lower() not in " ".join(hit.text.lower() for hit in hop_evidence.get(fact.hop, []))
+            if not cached_flags.get(fact.hop, False) and not _fact_supported(fact, hop_evidence)
         ]
         final_status = "verified"
         stored_facts: list[FactRecord] = []
@@ -556,7 +1175,7 @@ class AgentPipeline:
                     audit=audit_text,
                 )
             )
-            answer = self.llm.phrase_answer(request.question, facts)
+            answer = self.llm.phrase_answer(request.question, facts, self.store)
             for fact in facts:
                 stored_facts.append(memory.put(fact))
 
@@ -629,10 +1248,11 @@ class AgentPipeline:
             )
         )
         truth_hits = self.store.search(base_question, request.k)
-        truth_candidate = self._extract_fact(base_question, truth_hits, 1, plan.target_entity)
+        truth_candidates = self._extract_fact(base_question, truth_hits, 1, plan.target_entity)
+        truth_value = truth_candidates[0].value if truth_candidates else "Lord Byron"
         audit = (
             f"Contradiction detected. Hop 1 claimed '{poison_entity}' is the father of {plan.target_entity}, "
-            f"but the retrieved chunk states '{truth_candidate.value if truth_candidate else 'Lord Byron'}'. "
+            f"but the retrieved chunk states '{truth_value}'. "
             f"Hop 2 evidence for '{poison_entity}' does not support the claim. Chain halted before synthesis."
         )
         steps.append(
@@ -668,7 +1288,7 @@ class AgentPipeline:
             resolved_query = query
             if index == 2:
                 resolved_query = f"In which year did {corrected_facts[0].value} die?" if corrected_facts else death_question
-            step, candidate, _hits, _cached = self._retrieve(
+            step, candidates, _hits, _cached = self._retrieve(
                 resolved_query,
                 index,
                 request.k,
@@ -677,8 +1297,9 @@ class AgentPipeline:
                 counters,
             )
             steps.append(step)
-            if candidate:
-                corrected_facts.append(candidate)
+            for candidate in candidates:
+                if candidate.key not in {fact.key for fact in corrected_facts}:
+                    corrected_facts.append(candidate)
 
         if len(corrected_facts) < 2:
             answer = "Insufficient evidence in knowledge base"
@@ -686,7 +1307,7 @@ class AgentPipeline:
             verifier_status: Literal["abstain", "ok"] = "abstain"
             final_audit = "Corrected chain still lacks supported evidence; verifier abstained."
         else:
-            answer = self.llm.phrase_answer(request.question, corrected_facts)
+            answer = self.llm.phrase_answer(request.question, corrected_facts, self.store)
             final_status = "corrected"
             verifier_status = "ok"
             final_audit = (

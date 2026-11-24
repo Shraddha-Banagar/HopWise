@@ -142,4 +142,6 @@ class AgentViewModel : ViewModel() {
     }
 
     fun dismissError() = _uiState.update { it.copy(error = null) }
+
+    fun dismissResponse() = _uiState.update { it.copy(response = null, error = null) }
 }
